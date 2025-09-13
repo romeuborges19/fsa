@@ -1,6 +1,5 @@
 from datetime import datetime
 import json
-import math
 from multiprocessing import Process
 import os
 from typing import TypedDict
@@ -8,7 +7,7 @@ import pandas as pd
 from openai import BadRequestError, NotFoundError, OpenAI
 from decouple import config
 from openai.lib._parsing._completions import type_to_response_format_param
-from sqlalchemy import delete, select
+from sqlalchemy import delete, null, select
 from dto import RespostaLLM
 from config import SYSTEM_PROMPT, USER_PROMPT
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -26,8 +25,8 @@ session = Session()
 CAMINHO_NOTICIAS = "data/filtragem-llm/"
 CAMINHO_LOGS = "logs.csv"
 NUM_WORKERS = 16
-MAX_BATCHES = 10
-MINIMUM_BATCHES = 5
+MAX_BATCHES = 15
+MINIMUM_BATCHES = 10
 
 logger = get_logger()
 
@@ -219,6 +218,18 @@ def solicitar_processamento(client: OpenAI, log: BatchLog):
         batch = client.batches.retrieve(log.batch_id)
     except BadRequestError as err:
         logger.error(f"ticker={log.ticker} status=erro_ao_solicitar erro={err}")
+        return
+
+    if batch.errors:
+        erros = batch.errors.data or []
+        for erro in erros:
+            if erro.code == "invalid_type":
+                logger.info(f"ticker={log.ticker} erro=tipo_invalido status=pulando")
+
+                log.should_retry = False
+                log.batch_id = f"{log.batch_id}_invalid"
+                session.commit()
+                return
 
     if batch.status == "completed":
         logger.info(f"ticker={log.ticker} status=finalizado")
@@ -278,7 +289,14 @@ def processar_acoes():
 
     logger.info("== Solicitando ==")
 
-    stmt = select(BatchLog).where(BatchLog.should_retry == True)
+    stmt = (
+        select(BatchLog)
+        .where(
+            ((BatchLog.should_retry == True) & ~(BatchLog.batch_id.endswith("invalid")))
+            | (BatchLog.batch_id.is_(null()))
+        )
+        .order_by(BatchLog.id.asc())
+    )
     batch_logs = session.execute(stmt).scalars().all()
 
     processos = []
@@ -307,7 +325,7 @@ def processar_acoes():
 
 scheduler = BlockingScheduler()
 scheduler.add_job(processar_acoes, "date", run_date=datetime.now())
-scheduler.add_job(processar_acoes, "interval", minutes=3)
+scheduler.add_job(processar_acoes, "interval", minutes=5)
 
 
 def main():
